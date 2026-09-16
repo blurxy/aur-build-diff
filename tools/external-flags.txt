@@ -1,0 +1,14 @@
+# Flags the README MENTIONS but this project does not accept, one per line,
+# with the reason. Anything not listed here and not defined in src/ or bin/
+# makes tools/check-readme-claims.sh fail.
+#
+# This file exists so the check FAILS CLOSED. The alternative -- only counting
+# flags shown on a command line with one of our own binaries -- was tried and
+# silently stopped catching the bug the checker was written for, because the
+# flag in question was documented in prose rather than in a usage block.
+--unshare-net   bubblewrap's flag; discussed as the insufficient approach, not accepted by us
+--unshare-all   bubblewrap's flag, used internally in the sandbox argv
+--ro-bind       bubblewrap's flag, used internally
+--audio-format  yt-dlp's flag, used internally
+--no-playlist   yt-dlp's flag, used internally
+--dryrun        paccache's flag, quoted in a falsifier example
