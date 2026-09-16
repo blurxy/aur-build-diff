@@ -53,9 +53,12 @@ def versions(repo, limit=12):
             body = _git(["show", "%s:PKGBUILD" % sha], cwd=repo)
         except RuntimeError:
             continue
-        m = re.search(r"^pkgver\s*=\s*(\S+)", body, re.M)
-        r = re.search(r"^pkgrel\s*=\s*(\S+)", body, re.M)
-        ver = (m.group(1) if m else "?") + "-" + (r.group(1) if r else "?")
+        # strip surrounding quotes: pkgbuild-introspection renders pkgver='9',
+        # and the raw capture produced versions like '9'-'1'
+        def _val(pat):
+            mm = re.search(pat, body, re.M)
+            return mm.group(1).strip("'\"") if mm else "?"
+        ver = _val(r"^pkgver\s*=\s*(\S+)") + "-" + _val(r"^pkgrel\s*=\s*(\S+)")
         out.append((sha, date, ver))
     return out
 

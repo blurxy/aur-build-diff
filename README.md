@@ -3,10 +3,14 @@
 Build an AUR package twice — this version and the last known good one — in an
 isolated sandbox, and diff what each one actually *does*.
 
-> **Status: core prototype.** The sandbox and its isolation proof are real and
-> reproducible (`python src/sandbox.py`); the behaviour differ is real and
-> self-tested (`python src/profile.py`). Driving `makepkg` over real AUR git
-> history is not wired up yet.
+> **Status: the detector does not work yet, and the reason is architectural.**
+> The sandbox and its isolation proof are real and reproducible
+> (`aur-build-diff --check-sandbox`), the differ is real and self-tested, and
+> `aur-build-diff <pkg> --build` is wired end to end. But see
+> [What is broken](#what-is-broken) before trusting a verdict: the sandbox
+> blocks DNS, `makepkg` needs DNS to fetch `source=()`, so almost no real
+> package can build inside it. Two independent sessions ran it on two packages
+> and both got a confident `unchanged` for builds that never happened.
 
 ## Why dynamic, when good static scanners exist
 
@@ -46,6 +50,51 @@ permits the theft.
 
 `src/sandbox.py` proves isolation instead of assuming it, and runs the naive
 profile alongside as a control.
+
+## What is broken
+
+Two peer sessions ran this on `yay-bin` and `downgrade` and both got:
+
+```
+BUILD OUTCOMES
+  baseline  12.0.1-1   rc=0   usable
+  newer     12.0.2-1   rc=0   usable
+VERDICT: unchanged  -- no behavioural change
+```
+
+Both builds had died at `curl: (6) Could not resolve host: github.com`. Four
+separate defects stacked to produce that confident green:
+
+1. **The sandbox blocks DNS; `makepkg` needs DNS.** `source=()` is a remote URL
+   for nearly every AUR package, so the build aborts before reaching any code
+   worth judging. This is structural and applies to every package equally — not
+   toolchain drift, not moved sources.
+2. **`rc` was `tail`'s exit status, not `makepkg`'s.** The inner command piped
+   through `tail -40` with no `pipefail`, so a failed build reported `rc=0`
+   forever. `bash -lc 'false | tail -40'` returns 0; with `set -o pipefail`, 1.
+3. **The "did it build?" guard keyed on emptiness, and the profile wasn't empty.**
+   A build that dies while downloading has already exec'd bash, makepkg, curl and
+   the retry loop — ten distinct binaries, 471 calls. The guard was satisfied by
+   the harness's own machinery.
+4. **A failed build manufactures a network profile out of its own failure.**
+   Sixteen connects to the stub resolver, from curl's retries. An empty profile
+   at least *looks* wrong; this one looks like a real build and is entirely noise.
+
+Fixed: `pipefail`; build provenance attached to the profile rather than kept
+beside it; `diff()` raises `NoBaseline` rather than comparing against a build
+that did not happen; resolver attempts bucketed away from real endpoints;
+`summarise()` shows distinct/total so 16 attempts no longer render as "1".
+
+**Not fixed: defect 1.** The fix is a two-phase build — fetch sources *outside*
+the sandbox where downloading is expected, verify checksums, mount them
+read-only, then build offline. That makes the tool *stronger* rather than merely
+working: once the legitimate fetch has already happened, **any** network activity
+during the build is anomalous by construction. That kills the cargo/npm
+false-positive firehose structurally instead of by heuristic, catches a malicious
+*first* release that version-over-version cannot see, and lets `--skipinteg` go
+so a tampered source is caught by checksum.
+
+Until that lands, treat every `unchanged` from this tool as unverified.
 
 ## The hard part is the baseline, not the sandbox
 

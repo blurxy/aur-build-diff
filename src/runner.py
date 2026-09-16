@@ -25,7 +25,11 @@ def build(pkgbuild_dir, timeout=600, allow_dns=False, keep=False):
     if not shutil.which("strace"):
         raise RuntimeError("strace is required for the v1 capture layer")
 
-    inner = ("cd /build/pkg && "
+    # set -o pipefail is load-bearing: without it the exit status is tail's, so
+    # an aborted makepkg reported rc=0 and the runner called a failed build
+    # successful. Measured on yay-bin, which aborts at the download step inside
+    # a no-network sandbox and still returned 0.
+    inner = ("set -o pipefail; cd /build/pkg && "
              "strace -f -qq -s 256 -e %s -o /build/trace.txt "
              "makepkg --nodeps --noconfirm --skipinteg 2>&1 | tail -40" % TRACED)
     argv = bwrap_argv(work, allow_dns=allow_dns) + ["bash", "-lc", inner]
@@ -44,6 +48,21 @@ def build(pkgbuild_dir, timeout=600, allow_dns=False, keep=False):
             text = fh.read()
     meta["trace_bytes"] = len(text)
     prof = parse_strace(text)
+
+    # Attach provenance TO THE PROFILE. A build outcome kept beside the data
+    # gets separated from it: a caller passes the dict on, the outcome stays
+    # behind, and a failed build is compared as though it were a clean one.
+    tail = meta.get("tail", "")
+    aborted = ("==> ERROR:" in tail) or ("Aborting" in tail)
+    fetch_failed = ("Failure while downloading" in tail
+                    or "Could not resolve host" in tail)
+    prof["_build"] = {
+        "rc": meta["rc"],
+        "timed_out": meta["timeout"],
+        "aborted": aborted,
+        "fetch_failed": fetch_failed,
+        "usable": (not meta["timeout"]) and meta["rc"] == 0 and not aborted,
+    }
     if not keep:
         shutil.rmtree(work, ignore_errors=True)
     else:
@@ -52,4 +71,16 @@ def build(pkgbuild_dir, timeout=600, allow_dns=False, keep=False):
 
 
 def summarise(prof):
-    return {k: len(v) for k, v in prof.items()}
+    """Distinct values AND total occurrences.
+
+    Reporting len() alone rendered sixteen failed resolver attempts as
+    "connects: 1", which reads as "basically nothing happened". Distinct
+    endpoints are the right thing to DIFF on and the wrong thing to show alone.
+    """
+    out = {}
+    for k, v in prof.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        n, total = len(v), sum(v.values())
+        out[k] = "%d" % n if n == total else "%d/%d" % (n, total)
+    return out

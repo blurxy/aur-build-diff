@@ -20,6 +20,14 @@ class NoBaseline(Exception):
 # A build tree is allowed to be written to; that is what a build is.
 BUILD_PREFIXES = ("/build", "/tmp", "/dev", "/proc", "/sys", "/run")
 
+# The sandbox has no DNS, so every resolver attempt inside it goes to the stub at
+# loopback:53 and FAILS. Those are artefacts of the sandbox, not behaviour of the
+# package: a build that aborts on "could not resolve host" contributed sixteen of
+# them, and they would diff against a later build's real endpoints as though they
+# were comparable. Kept in their own bucket so they can be counted without
+# polluting the endpoint namespace. (rafiulbari-0e, 2026-09-16.)
+RESOLVER_ENDPOINTS = ("127.0.0.1:53", "127.0.0.53:53", "::1:53")
+
 # Match the quoted address specifically. A lazy [^)]*? before the capture will
 # happily consume into `inet_addr(` and capture a single letter out of it --
 # which is exactly what it did, yielding endpoints like "e:443" that compared
@@ -41,13 +49,17 @@ def parse_strace(text):
     rather than pretended away.
     """
     prof = {"connects": Counter(), "execs": Counter(), "writes_outside": Counter(),
-            "names": Counter()}
+            "names": Counter(), "resolver_attempts": Counter()}
     for line in text.splitlines():
         m = _CONNECT.search(line)
         if m:
             port, addr = m.group(1), m.group(2)
             if addr not in ("", "0.0.0.0"):
-                prof["connects"]["%s:%s" % (addr, port)] += 1
+                ep = "%s:%s" % (addr, port)
+                if ep in RESOLVER_ENDPOINTS:
+                    prof["resolver_attempts"][ep] += 1
+                else:
+                    prof["connects"][ep] += 1
         m = _EXECVE.search(line)
         if m:
             prof["execs"][m.group(1)] += 1
@@ -66,10 +78,23 @@ def parse_strace(text):
 def looks_unbuilt(prof):
     """A profile from a build that did not really run.
 
-    Every real makepkg invocation execs something -- at minimum bash and the
-    packaging helpers. A profile with no execs did not observe a build, whether
-    because it failed, timed out, or the trace was never written.
+    TWO WAYS A BUILD FAILS TO PRODUCE A BASELINE, and the second defeated the
+    first version of this check.
+
+    1. It never started: no execs at all.
+    2. IT STARTED AND DIED. A makepkg that aborts while downloading sources has
+       already exec'd bash, curl, makepkg and friends -- ten of them, measured
+       on yay-bin -- so an execs-count heuristic passes it as usable. Then both
+       versions fail identically, the diff shows no delta, and the verdict reads
+       "unchanged", which is indistinguishable from a genuinely clean result.
+       Predicted by rafiulbari-0e before it was found.
+
+    So the runner attaches the real outcome and this trusts that when present,
+    falling back to the heuristic only for profiles built by hand.
     """
+    b = prof.get("_build")
+    if isinstance(b, dict):
+        return not b.get("usable", False)
     return not prof.get("execs")
 
 
@@ -89,8 +114,12 @@ def diff(old, new):
     could not guarantee. (rafiulbari's alienware-main-chat, 2026-09-16.)
     """
     if looks_unbuilt(old):
-        raise NoBaseline("the baseline profile records no execs, so the baseline "
-                         "build did not run; there is nothing to compare against")
+        b = old.get("_build") or {}
+        why = ("it aborted (%s)" % ("failed to fetch sources" if b.get("fetch_failed")
+                                    else "rc=%s" % b.get("rc"))
+               if b else "it records no execs, so it never ran")
+        raise NoBaseline("the baseline build produced no usable profile: %s. "
+                         "There is nothing to compare against." % why)
     out = {}
     for key in ("connects", "execs", "writes_outside", "names"):
         o, n = set(old.get(key, {})), set(new.get(key, {}))
