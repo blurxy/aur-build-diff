@@ -75,6 +75,56 @@ Known limitations, stated rather than discovered later:
   full download-and-execute chain would require a local sinkhole serving the
   captured payload — a bigger, disclosed setup.
 
+## It works end to end
+
+Real `makepkg`, real `strace`, real sandbox. The pair below is synthetic — content
+written for this test, so nothing untrusted executes — and differs only by three
+added lines that resolve a name and reach out:
+
+```
+build      rc   execs  connects   writes-outside
+clean       0      28         0                3
+hijacked    0      30         1                3
+
+VERDICT: changed
+  - new outbound endpoints: 127.0.0.1:53
+  - executed binaries absent from the previous build: /usr/bin/curl, /usr/bin/getent
+
+control (clean vs clean): unchanged
+```
+
+Three details in that output are the whole design:
+
+**`writes_outside: 3` in BOTH builds.** makepkg legitimately writes outside the
+build tree. A rule like "wrote outside $srcdir = suspicious" would fire on every
+package ever built. The diff is one-directional against the package's own
+previous behaviour, so identical noise cancels and only the *change* survives.
+
+**The connect is to `127.0.0.1:53`, not to example.com.** The sandbox has no
+route out, so the exfil attempt appears as a refused resolver call rather than a
+completed download. That is still a clean catch, and it is what the tool can
+honestly claim to observe — building the full download-and-execute chain would
+need a local sinkhole serving the captured payload, which is a larger and
+disclosed setup.
+
+**The control is silent.** A differ that flags everything is not a differ.
+
+### Against a real package
+
+`src/aur.py` reads a package's own git history — every AUR package is a git repo
+whose commits are successive PKGBUILDs — which is where the baseline comes from:
+
+```
+exists(yay-bin): True
+  13e0a4754d  2026-06-19  13.0.1-1
+  f559115d63  2026-06-17  13.0.0-1
+  d091abaa64  2026-06-07  12.6.0-1
+  1751e24c43  2025-12-14  12.5.7-1
+```
+
+Metadata only — nothing above was built. Building a real package is a deliberate
+act the user takes, not something a README demo does for them.
+
 ## Run it
 
 ```
