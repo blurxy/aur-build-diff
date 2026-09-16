@@ -128,11 +128,31 @@ act the user takes, not something a README demo does for them.
 ## Run it
 
 ```
-python src/sandbox.py     # proves the sandbox is isolated, with a control
-python src/profile.py     # self-test of the differ on synthetic traces
+aur-build-diff --check-sandbox      # prove isolation holds here, with a control
+aur-build-diff <pkg> --history      # list the package's PKGBUILD revisions
+aur-build-diff <pkg>                # plan only -- shows what WOULD be built
+aur-build-diff <pkg> --build        # actually build both versions and diff
 ```
 
-Nothing here downloads or executes a real package yet.
+**Building is opt-in and that is deliberate.** `makepkg` executes arbitrary code
+from a PKGBUILD, and the entire premise of this tool is that you do not yet know
+whether that code is hostile. The sandbox is real and is re-verified before every
+run — but a sandbox is a mitigation, not a permission slip. The default prints a
+plan and executes nothing.
+
+It also refuses to build at all if `--check-sandbox` does not pass on your
+machine, rather than proceeding with weaker isolation than it claims.
+
+When the baseline build fails — and old PKGBUILDs do fail, sources move and
+toolchains drift — the verdict is `unknown`, not `clean`. A comparison against a
+build that did not happen is not a comparison.
+
+Self-tests, no network or package needed:
+
+```
+python src/sandbox.py          # isolation, hardened vs permissive
+python src/profile.py          # the differ, on synthetic traces
+```
 
 ## License
 
