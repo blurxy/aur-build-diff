@@ -13,6 +13,10 @@ releases and now it does. That is what this module computes.
 import re, json, os
 from collections import Counter
 
+
+class NoBaseline(Exception):
+    """Raised when the older build produced no usable profile to compare against."""
+
 # A build tree is allowed to be written to; that is what a build is.
 BUILD_PREFIXES = ("/build", "/tmp", "/dev", "/proc", "/sys", "/run")
 
@@ -59,12 +63,34 @@ def parse_strace(text):
     return {k: dict(v) for k, v in prof.items()}
 
 
+def looks_unbuilt(prof):
+    """A profile from a build that did not really run.
+
+    Every real makepkg invocation execs something -- at minimum bash and the
+    packaging helpers. A profile with no execs did not observe a build, whether
+    because it failed, timed out, or the trace was never written.
+    """
+    return not prof.get("execs")
+
+
 def diff(old, new):
     """What the new version does that the old one never did.
 
-    Deliberately one-directional. A build that STOPPED contacting a host is not
-    interesting; a build that started is.
+    Deliberately one-directional: a build that STOPPED contacting a host is not
+    interesting, a build that started is.
+
+    REFUSES AN UNUSABLE BASELINE rather than diffing against it. If the older
+    build failed, its profile is empty, and an empty baseline makes EVERY
+    behaviour of the new version look newly introduced -- including /usr/bin/gcc.
+    "New version fetches during build, old version's build FAILED" and "new
+    version fetches, old version did not" produce an identical diff and mean
+    completely different things. Raising here means the distinction cannot be
+    lost by a caller who forgot to check, which a separate guard in the CLI
+    could not guarantee. (rafiulbari's alienware-main-chat, 2026-09-16.)
     """
+    if looks_unbuilt(old):
+        raise NoBaseline("the baseline profile records no execs, so the baseline "
+                         "build did not run; there is nothing to compare against")
     out = {}
     for key in ("connects", "execs", "writes_outside", "names"):
         o, n = set(old.get(key, {})), set(new.get(key, {}))
@@ -72,6 +98,18 @@ def diff(old, new):
         if added:
             out[key] = added
     return out
+
+
+def compare(old, new, has_history=True):
+    """diff + verdict in one call, carrying baseline provenance honestly."""
+    if not has_history:
+        return "unknown", ["no prior version to diff against; static allowlist only"], {}
+    try:
+        d = diff(old, new)
+    except NoBaseline as e:
+        return "unknown", ["%s" % e], {}
+    v, why = verdict(d, has_history=True)
+    return v, why, d
 
 
 def verdict(d, has_history=True):
@@ -110,13 +148,18 @@ execve("/tmp/.cache/update", ["update"], 0x0) = 0
 openat(AT_FDCWD, "/home/u/.config/systemd/user/upd.service", O_WRONLY|O_CREAT, 0644) = 8
 '''
     a, b = parse_strace(clean), parse_strace(hijacked)
-    d = diff(a, b)
-    v, why = verdict(d)
+    v, why, d = compare(a, b)
     print("baseline build:", json.dumps(a, indent=None)[:120])
     print("\nverdict: %s" % v)
     for w in why:
         print("  - %s" % w)
     assert v == "changed" and "connects" in d and "execs" in d, "differ failed"
-    v2, why2 = verdict(diff(a, a))
+    v2, _why2, _d2 = compare(a, a)
     assert v2 == "unchanged", "clean-vs-clean must not alarm"
+
+    # a failed baseline must NOT render as "the new version introduced everything"
+    empty = {"connects": {}, "execs": {}, "writes_outside": {}, "names": {}}
+    v3, why3, _ = compare(empty, b)
+    assert v3 == "unknown", "an unbuilt baseline must be unknown, not changed"
     print("\nself-test: changed-detects=OK  clean-vs-clean-silent=OK")
+    print("           failed-baseline -> %s (%s)" % (v3, why3[0][:60]))

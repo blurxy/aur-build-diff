@@ -15,7 +15,7 @@ import argparse, os, shutil, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aur, sandbox
-from profile import diff, verdict
+from profile import compare, looks_unbuilt
 from runner import build as run_build, summarise
 
 
@@ -74,27 +74,37 @@ def cmd_diff(a):
             print("and no resolver socket, verified before each run.")
             return 0
 
-        profs = {}
+        profs, builds = {}, {}
         for label, (sha, _d, ver) in (("baseline", old), ("newer", new)):
             d = aur.checkout_to(repo, sha, os.path.join(tmp, label))
             print("\nbuilding %s (%s)..." % (label, ver))
             p, meta = run_build(d, timeout=a.timeout)
             profs[label] = p
+            ok = (not meta["timeout"]) and meta["rc"] in (0, None) and not looks_unbuilt(p)
+            builds[label] = {"version": ver, "rc": meta["rc"],
+                             "timed_out": meta["timeout"], "usable": ok}
             note = "timed out" if meta["timeout"] else "rc=%s" % meta["rc"]
             print("  %s  trace=%d B  %s" % (note, meta["trace_bytes"], summarise(p)))
-            if meta["timeout"] or (meta["rc"] not in (0, None)):
-                print("  NOTE: this build did not succeed. A failed baseline means")
-                print("  there is NO comparison -- an old PKGBUILD may simply not")
-                print("  reproduce today (moved sources, drifted toolchain).")
-                if label == "baseline":
-                    print("\nVERDICT: unknown -- baseline did not build.")
-                    return 0
+            if not ok:
+                print("  this build did not produce a usable profile")
 
-        d = diff(profs["baseline"], profs["newer"])
-        v, why = verdict(d, has_history=True)
+        # Report what each build DID, separately from the comparison. A diff
+        # cannot distinguish "the old version did not do this" from "the old
+        # version did not build", and those mean opposite things.
+        print("\nBUILD OUTCOMES")
+        for label in ("baseline", "newer"):
+            b = builds[label]
+            print("  %-9s %-14s rc=%-5s %s" % (
+                label, b["version"], b["rc"],
+                "usable" if b["usable"] else "NOT USABLE -- excluded from the comparison"))
+
+        v, why, _d = compare(profs["baseline"], profs["newer"], has_history=True)
         print("\nVERDICT: %s" % v)
         for w in why:
             print("  - %s" % w)
+        if v == "unknown":
+            print("\n  An old PKGBUILD may simply not reproduce today -- sources move,")
+            print("  toolchains drift. That is not evidence about the new version.")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
