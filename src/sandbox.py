@@ -84,9 +84,21 @@ def bwrap_argv(workdir, extra_ro=(), allow_dns=False, allow_net=False):
         # io.systemd.Resolve UNIX SOCKET that this whole sandbox exists to keep out; binding
         # the directory to fix DNS would reopen the exfiltration channel in the one phase
         # that has network. A file bind cannot carry a socket.
+        # AND IT CANNOT BE BOUND AT /etc/resolv.conf: that path is itself the symlink, and
+        # bwrap refuses with "Can't mount on symlink destination". Measured -- the whole jail
+        # failed to start, so the fetch silently never ran and the build aborted at download
+        # exactly as before, which looked identical to having no fix at all.
+        #
+        # So satisfy the symlink instead of replacing it: recreate its TARGET PATH inside our
+        # own tmpfs /run and bind just the file there. /run stays a tmpfs we control, the
+        # directory contains nothing but this one read-only file, and the
+        # io.systemd.Resolve socket still cannot exist in it -- which is the property the
+        # build jail depends on and the fetch jail must not quietly surrender.
         real = os.path.realpath("/etc/resolv.conf")
         if os.path.isfile(real):
-            argv += ["--ro-bind", real, "/etc/resolv.conf"]
+            link = os.path.normpath(os.path.join("/etc", os.readlink("/etc/resolv.conf"))) \
+                   if os.path.islink("/etc/resolv.conf") else "/etc/resolv.conf"
+            argv += ["--dir", os.path.dirname(link), "--ro-bind", real, link]
     return argv
 
 
