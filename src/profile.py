@@ -35,7 +35,13 @@ RESOLVER_ENDPOINTS = ("127.0.0.1:53", "127.0.0.53:53", "::1:53")
 _CONNECT = re.compile(
     r'connect\(\d+,\s*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\).*?"([0-9a-fA-F:.]+)"')
 _EXECVE = re.compile(r'execve\("([^"]+)"')
-_OPENW = re.compile(r'open(?:at)?\((?:AT_FDCWD|\d+),\s*"([^"]+)",\s*([^,)]+)')
+# Capture the RESULT too. Without it a refused write counts identically to a
+# successful one -- and inside this sandbox /usr and /etc are read-only binds, so
+# a SUCCESSFUL write outside the build tree is very nearly impossible by
+# construction and almost everything here is an attempt. An attempt is the better
+# signal; the defect was calling it "wrote". (rafiulbari-0e, 2026-09-16.)
+_OPENW = re.compile(
+    r'open(?:at)?\((?:AT_FDCWD|\d+),\s*"([^"]+)",\s*([^,)]+)(?:,[^)]*)?\)\s*=\s*(-?\d+)')
 _GETADDR = re.compile(r'(?:sendto|write)\(\d+,\s*".*?([a-z0-9][a-z0-9.-]{3,}\.[a-z]{2,})')
 
 
@@ -49,7 +55,8 @@ def parse_strace(text):
     rather than pretended away.
     """
     prof = {"connects": Counter(), "execs": Counter(), "writes_outside": Counter(),
-            "names": Counter(), "resolver_attempts": Counter()}
+            "names": Counter(), "resolver_attempts": Counter(),
+            "writes_denied": Counter(), "writes_relative": Counter()}
     for line in text.splitlines():
         m = _CONNECT.search(line)
         if m:
@@ -65,10 +72,21 @@ def parse_strace(text):
             prof["execs"][m.group(1)] += 1
         m = _OPENW.search(line)
         if m:
-            path, flags = m.group(1), m.group(2)
-            if ("O_WRONLY" in flags or "O_RDWR" in flags or "O_CREAT" in flags) \
-               and not path.startswith(BUILD_PREFIXES):
-                prof["writes_outside"][path] += 1
+            path, flags, res = m.group(1), m.group(2), int(m.group(3))
+            if "O_WRONLY" in flags or "O_RDWR" in flags or "O_CREAT" in flags:
+                if not path.startswith("/"):
+                    # A RELATIVE path is build-tree-relative by construction: the
+                    # sandbox chdirs to /build. Counting it as "outside" flagged
+                    # .PKGINFO, .BUILDINFO and .MTREE on every build ever run --
+                    # invisible while both sides produced them and cancelled in
+                    # the diff, then surfacing as a security-sounding red the
+                    # moment one side had one extra.
+                    prof["writes_relative"][path] += 1
+                elif not path.startswith(BUILD_PREFIXES):
+                    if res < 0:
+                        prof["writes_denied"][path] += 1
+                    else:
+                        prof["writes_outside"][path] += 1
         m = _GETADDR.search(line)
         if m:
             prof["names"][m.group(1)] += 1
@@ -121,7 +139,7 @@ def diff(old, new):
         raise NoBaseline("the baseline build produced no usable profile: %s. "
                          "There is nothing to compare against." % why)
     out = {}
-    for key in ("connects", "execs", "writes_outside", "names"):
+    for key in ("connects", "execs", "writes_outside", "writes_denied", "names"):
         o, n = set(old.get(key, {})), set(new.get(key, {}))
         added = sorted(n - o)
         if added:
@@ -156,7 +174,10 @@ def verdict(d, has_history=True):
     if d.get("connects"):
         why.append("new outbound endpoints: %s" % ", ".join(d["connects"][:5]))
     if d.get("writes_outside"):
-        why.append("wrote outside the build tree: %s" % ", ".join(d["writes_outside"][:5]))
+        why.append("WROTE outside the build tree: %s" % ", ".join(d["writes_outside"][:5]))
+    if d.get("writes_denied"):
+        why.append("ATTEMPTED to write outside the build tree and was refused: %s"
+                   % ", ".join(d["writes_denied"][:5]))
     if d.get("execs"):
         why.append("executed binaries absent from the previous build: %s" % ", ".join(d["execs"][:5]))
     return ("changed" if why else "unchanged"), (why or ["no behavioural change"])

@@ -79,11 +79,56 @@ separate defects stacked to produce that confident green:
 4. **A failed build manufactures a network profile out of its own failure.**
    Sixteen connects to the stub resolver, from curl's retries. An empty profile
    at least *looks* wrong; this one looks like a real build and is entirely noise.
+5. **Every relative path counted as "outside the build tree".**
+   `not path.startswith(("/build", ...))` is true for any non-absolute path, so
+   `.PKGINFO`, `.BUILDINFO` and `.MTREE` — written by makepkg inside `$pkgdir` —
+   were flagged on every build ever run. They cancelled in the diff while both
+   sides produced them, then surfaced as a security-sounding red the moment one
+   side had one extra. This is defect 4 inverted: failure artefacts manufacture a
+   false *green*, relative paths a false *red*.
+6. **A refused write counted the same as a successful one.** The parser read the
+   path and flags and never the syscall's return value. Inside this sandbox
+   `/usr` and `/etc` are read-only binds, so a *successful* write outside the
+   build tree is nearly impossible by construction — almost everything in that
+   field was an attempt. The fix is not to discard the failures: an **attempt**
+   to write outside the build tree is better signal than a success. The defect
+   was the word "wrote".
 
 Fixed: `pipefail`; build provenance attached to the profile rather than kept
 beside it; `diff()` raises `NoBaseline` rather than comparing against a build
-that did not happen; resolver attempts bucketed away from real endpoints;
-`summarise()` shows distinct/total so 16 attempts no longer render as "1".
+that did not happen; resolver attempts, relative writes and *refused* writes each
+given their own namespace instead of being filtered; `summarise()` shows
+distinct/total so 16 attempts no longer render as "1"; the verdict now says
+**WROTE** or **ATTEMPTED and was refused**, which are different findings.
+
+The recurring shape in 4, 5 and 6: a field populated with things that are not
+what the field claims to hold. The repair is always the same — give the different
+thing its own namespace rather than filtering it out, because filtering discards
+signal and leaves the name still lying.
+
+### Packages that build today, without the fetch phase
+
+Any package whose `source=()` is local files needs no network, so it completes in
+the sandbox as it stands. This is the regression corpus (found by `rafiulbari-0e`):
+
+```
+bash-pipes               13 revs   source=() empty entirely
+mkinitcpio-firmware      12 revs
+pacman-cleanup-hook       9 revs
+systemd-boot-pacman-hook  8 revs
+update-grub               3 revs
+```
+
+Real end-to-end run, and the first correct verdict the tool produced:
+
+```
+pacman-cleanup-hook  1.0-8 -> 1.1-1
+  baseline  29/504 execs, writes_relative 3/4
+  newer     29/504 execs, writes_relative 4/5
+  VERDICT: unchanged
+```
+
+The extra relative write is visible in the profile and correctly not a finding.
 
 **Not fixed: defect 1.** The fix is a two-phase build — fetch sources *outside*
 the sandbox where downloading is expected, verify checksums, mount them
