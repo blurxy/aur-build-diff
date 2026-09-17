@@ -130,7 +130,27 @@ pacman-cleanup-hook  1.0-8 -> 1.1-1
 
 The extra relative write is visible in the profile and correctly not a finding.
 
-**Not fixed: defect 1.** The fix is a two-phase build — fetch sources *outside*
+7. **Right field, right count, wrong attribution — and nothing is filterable.**
+   `mkinitcpio-firmware` 1.0.0 -> 1.6.0 correctly read `changed`, naming
+   `/usr/bin/file`, `/usr/bin/ln`, `/usr/bin/readelf` and `/usr/bin/install` as
+   newly executed. Only `install` appears in the newer PKGBUILD. The other three
+   are makepkg's own tidy/strip machinery, which runs *because* the package
+   gained a `package()` function — so they appeared **because of** the change
+   rather than **as part of** it. Every one of those execs really happened. The
+   data is correct and it licenses a false inference: "executed
+   `/usr/bin/readelf`" is a sentence a hijacked PKGBUILD would earn, and here it
+   means the package finally installs a file. This is worse than defects 4–6 —
+   those produce noise you can filter, this is a **true statement supporting a
+   wrong conclusion**, so no filter can reach it.
+
+   The obvious fix does not work. `fakeroot` looked like a clean phase boundary,
+   but measured on that build: `readelf` at execve 468 (after fakeroot at 229),
+   while `file` at 224 and `ln` at 223 land *before* it — they are makepkg's
+   extraction machinery, not its packaging phase. Attribution needs to separate
+   harness from subject some other way, and a heuristic would be the seventh
+   guess in one evening. Left open deliberately. Found by `rafiulbari-0e`.
+
+**Not fixed: defects 1 and 7.** The fix is a two-phase build — fetch sources *outside*
 the sandbox where downloading is expected, verify checksums, mount them
 read-only, then build offline. That makes the tool *stronger* rather than merely
 working: once the legitimate fetch has already happened, **any** network activity
@@ -139,7 +159,33 @@ false-positive firehose structurally instead of by heuristic, catches a maliciou
 *first* release that version-over-version cannot see, and lets `--skipinteg` go
 so a tampered source is caught by checksum.
 
-Until that lands, treat every `unchanged` from this tool as unverified.
+Until that lands, treat every `unchanged` from this tool as unverified — and
+read a `changed` naming makepkg's own tools (`file`, `ln`, `readelf`, `strip`,
+`bsdtar`, `fakeroot`) as "this package started producing output", not as
+"this package started inspecting binaries".
+
+### Can it detect anything?
+
+Five corpus packages all returning `unchanged` is not evidence — a suite that has
+never been red proves nothing. `python src/selftest_detect.py` builds a real
+PKGBUILD, then the same one plus an injected `build()` block, and asserts the
+difference is found:
+
+```
+baseline  execs 30/505  resolver_attempts 0    writes_denied 0
+injected  execs 33/509  resolver_attempts 1/4  writes_denied 1
+
+VERDICT: changed
+  - ATTEMPTED to write outside the build tree and was refused:
+      /usr/lib/selftest-should-be-refused
+  - executed binaries absent from the previous build:
+      /usr/bin/env, /usr/bin/getent, /usr/bin/true
+
+control (real build vs itself): unchanged
+```
+
+The baseline carries makepkg's genuine 400-grep machinery, so this also shows the
+injected signal survives being diffed against real noise.
 
 ## The hard part is the baseline, not the sandbox
 
