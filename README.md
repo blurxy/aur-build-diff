@@ -3,14 +3,20 @@
 Build an AUR package twice — this version and the last known good one — in an
 isolated sandbox, and diff what each one actually *does*.
 
-> **Status: the detector does not work yet, and the reason is architectural.**
-> The sandbox and its isolation proof are real and reproducible
-> (`aur-build-diff --check-sandbox`), the differ is real and self-tested, and
-> `aur-build-diff <pkg> --build` is wired end to end. But see
-> [What is broken](#what-is-broken) before trusting a verdict: the sandbox
-> blocks DNS, `makepkg` needs DNS to fetch `source=()`, so almost no real
-> package can build inside it. Two independent sessions ran it on two packages
-> and both got a confident `unchanged` for builds that never happened.
+> **Status: it builds real packages and detects a real injected change. Read
+> [What is broken](#what-is-broken) before trusting a verdict.**
+> The sandbox and its isolation proof are reproducible
+> (`aur-build-diff --check-sandbox`), the differ is self-tested, and
+> `src/selftest_detect.py` is a positive control: it injects a change into a real
+> build and asserts the tool goes red, because a suite that has never been red
+> proves nothing.
+>
+> The defect that made this unusable — the sandbox blocked DNS, `makepkg` needs
+> DNS to fetch `source=()`, so almost no package could build and two sessions got
+> a confident `unchanged` for builds that never happened — is **fixed**, by
+> splitting fetch and build into two jails with different privileges. What
+> remains open is **defect 7**: an attribution bug where every number is correct
+> and the sentence they support is wrong.
 
 ## Why dynamic, when good static scanners exist
 
@@ -65,10 +71,11 @@ VERDICT: unchanged  -- no behavioural change
 Both builds had died at `curl: (6) Could not resolve host: github.com`. Four
 separate defects stacked to produce that confident green:
 
-1. **The sandbox blocks DNS; `makepkg` needs DNS.** `source=()` is a remote URL
-   for nearly every AUR package, so the build aborts before reaching any code
-   worth judging. This is structural and applies to every package equally — not
-   toolchain drift, not moved sources.
+1. ~~**The sandbox blocks DNS; `makepkg` needs DNS.**~~ **FIXED.** `source=()` is a
+   remote URL for nearly every AUR package, so the build aborted before reaching
+   any code worth judging — structurally, for every package equally. Fixed by
+   splitting the run into two jails with different privileges (see *The two-phase
+   build* below). Fixed by the session `alienware-main-chat`.
 2. **`rc` was `tail`'s exit status, not `makepkg`'s.** The inner command piped
    through `tail -40` with no `pipefail`, so a failed build reported `rc=0`
    forever. `bash -lc 'false | tail -40'` returns 0; with `set -o pipefail`, 1.
@@ -150,19 +157,68 @@ The extra relative write is visible in the profile and correctly not a finding.
    harness from subject some other way, and a heuristic would be the seventh
    guess in one evening. Left open deliberately. Found by `rafiulbari-0e`.
 
-**Not fixed: defects 1 and 7.** The fix is a two-phase build — fetch sources *outside*
-the sandbox where downloading is expected, verify checksums, mount them
-read-only, then build offline. That makes the tool *stronger* rather than merely
-working: once the legitimate fetch has already happened, **any** network activity
-during the build is anomalous by construction. That kills the cargo/npm
-false-positive firehose structurally instead of by heuristic, catches a malicious
-*first* release that version-over-version cannot see, and lets `--skipinteg` go
-so a tampered source is caught by checksum.
+**Not fixed: defect 7.** Read a `changed` that names makepkg's own tools (`file`,
+`ln`, `readelf`, `strip`, `bsdtar`, `fakeroot`) as "this package started producing
+output", not as "this package started inspecting binaries".
 
-Until that lands, treat every `unchanged` from this tool as unverified — and
-read a `changed` naming makepkg's own tools (`file`, `ln`, `readelf`, `strip`,
-`bsdtar`, `fakeroot`) as "this package started producing output", not as
-"this package started inspecting binaries".
+## The two-phase build
+
+Defect 1 was the architectural one: the sandbox existed to deny network, and
+`makepkg` cannot fetch `source=()` without it. The fix is two jails with
+different privileges rather than one jail with a compromise.
+
+```
+FETCH   network ON, nothing worth taking reachable.  makepkg --verifysource
+BUILD   sources already present, no route, no resolver.
+```
+
+Fetching on the host was never an option: `makepkg --verifysource` **sources** the
+PKGBUILD, so the package's own code runs at parse time. Doing that unsandboxed
+hands arbitrary execution to the thing under examination. The residual risk is
+stated rather than hidden — the fetch jail has network *and* runs parse-time
+code, and what contains it is that there is nothing there to take: no `$HOME`,
+no `~/.ssh`, no blanket bind of `/`.
+
+Two things that were not obvious:
+
+- **`/etc/resolv.conf` on Arch is a symlink into `/run`**, and `/run` is the
+  sandbox's own fresh tmpfs, so the symlink dangles and DNS fails *even with*
+  `--share-net`. The hardening breaks legitimate resolution as a side effect.
+- **It cannot simply be bound at `/etc/resolv.conf`** — that path *is* the
+  symlink, and bwrap refuses with `Can't mount on symlink destination`. The jail
+  then fails to **start**, which looks byte-for-byte identical to having no fix
+  at all. Fixed by satisfying the symlink instead of replacing it: recreate its
+  target path inside our own tmpfs and bind only the file there, then remount
+  that directory read-only.
+
+Verified, both jails, independently of the session that wrote it:
+
+```
+FETCH (net)     dir write:DENIED   entries: stub-resolv.conf   sockets:0   dns:RESOLVED
+BUILD (no net)  dir write:DENIED   entries: (none)             sockets:0   dns:blocked
+```
+
+The `sockets:0` line is the one that matters. The host has
+`/run/systemd/resolve/io.systemd.Resolve` and `.Monitor`; `find /run -type s`
+inside the net-enabled fetch jail returns nothing. The fetch phase gets DNS
+without getting the unix socket this sandbox exists to keep out.
+
+**Why this makes the tool stronger, not merely working.** Once the legitimate
+fetch has already happened in the other jail, **any** name resolution during the
+build is anomalous by construction. Measured on `downgrade`:
+
+| | before | after |
+|---|---|---|
+| trace | 450,832 B | 2,473,152 B |
+| execs | 10 / 224 | 35 / 664 |
+| `resolver_attempts` | 1 / 16 | **0** |
+| verdict | `unchanged` | `unchanged` |
+
+Both verdicts read `unchanged` and they mean opposite things: the first pair is
+two identical *failures*, the second is two identical *successes*. That kills the
+cargo/npm false-positive firehose structurally instead of by heuristic, and it
+let `--skipinteg` go — so a tampered source now fails a checksum instead of
+being waved through by the tool built to inspect it.
 
 ### Can it detect anything?
 

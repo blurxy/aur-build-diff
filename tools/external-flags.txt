@@ -12,7 +12,8 @@
 --audio-format  yt-dlp's flag, used internally
 --no-playlist   yt-dlp's flag, used internally
 --dryrun        paccache's flag, quoted in a falsifier example
---skipinteg     makepkg's flag; passed by the runner and discussed as something to REMOVE once sources are pre-fetched
+--skipinteg     makepkg's flag; NO LONGER PASSED -- removed once the fetch phase landed, discussed in the README as history
+--verifysource  makepkg's flag, passed by the runner in the fetch jail
 --noextract     makepkg's flag; named in the two-phase design, not accepted by us
 --nodeps        makepkg's flag, passed by the runner
 --noconfirm     makepkg's flag, passed by the runner
