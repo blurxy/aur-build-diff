@@ -22,8 +22,28 @@ So: no blanket bind of /, and /run is a fresh tmpfs.
 import os, shutil, subprocess
 
 
-def bwrap_argv(workdir, extra_ro=(), allow_dns=False):
-    """argv for an isolated build sandbox rooted at `workdir`."""
+def bwrap_argv(workdir, extra_ro=(), allow_dns=False, allow_net=False):
+    """argv for an isolated build sandbox rooted at `workdir`.
+
+    allow_net is for the FETCH PHASE ONLY and it is a different threat model, not a
+    relaxation of this one. makepkg cannot download `source=()` with no route and no
+    resolver, so with network off EVERY package aborts at "Retrieving sources" -- measured
+    2026-09-16 on `downgrade`, where both builds reported rc=0 having downloaded nothing.
+
+    Fetching on the HOST is not the alternative: `makepkg --verifysource` SOURCES the
+    PKGBUILD, so the package's own code runs at parse time. Doing that outside a sandbox
+    would hand arbitrary execution to the thing under examination, which is worse than the
+    bug it fixes.
+
+    So there are two sandboxes with different privileges, and the split is the point:
+      FETCH  network ON, nothing but the package dir writable, no build phase reached
+      BUILD  network OFF, sources already present, checksums verified
+    Anything the BUILD phase does on the network is then genuinely the build reaching out,
+    because the legitimate download already happened in a different jail. That removes the
+    cargo/npm false-positive problem structurally instead of by heuristic -- and it is why
+    --skipinteg can be dropped, so a tampered source fails a checksum instead of being
+    waved through.
+    """
     argv = [
         "bwrap",
         "--ro-bind", "/usr", "/usr",
@@ -40,6 +60,9 @@ def bwrap_argv(workdir, extra_ro=(), allow_dns=False):
         "--bind", workdir, "/build",
         "--chdir", "/build",
         "--unshare-all",
+        # --share-net re-shares ONLY the network namespace, after --unshare-all took
+        # everything. Order matters to bwrap: the later flag wins.
+    ] + (["--share-net"] if allow_net else []) + [
         "--new-session",          # no terminal to inject keystrokes into
         "--die-with-parent",
         "--setenv", "HOME", "/build",
@@ -50,6 +73,20 @@ def bwrap_argv(workdir, extra_ro=(), allow_dns=False):
             argv += ["--ro-bind", p, p]
     if allow_dns:
         argv += ["--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve"]
+    if allow_net:
+        # RESOLVER CONFIG FOR THE FETCH JAIL, and the reason it is needed is a consequence
+        # of this file's own hardening. On Arch /etc/resolv.conf is a SYMLINK into
+        # /run/systemd/resolve/, and /run here is a fresh tmpfs -- so the symlink dangles
+        # and name resolution fails even with the network shared. Measured 2026-09-16:
+        # --share-net alone gave `curl: (6) Could not resolve host: github.com`.
+        #
+        # Bind the FILE, never the directory. /run/systemd/resolve also contains the
+        # io.systemd.Resolve UNIX SOCKET that this whole sandbox exists to keep out; binding
+        # the directory to fix DNS would reopen the exfiltration channel in the one phase
+        # that has network. A file bind cannot carry a socket.
+        real = os.path.realpath("/etc/resolv.conf")
+        if os.path.isfile(real):
+            argv += ["--ro-bind", real, "/etc/resolv.conf"]
     return argv
 
 
