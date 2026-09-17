@@ -14,6 +14,48 @@ from profile import parse_strace
 
 TRACED = "trace=connect,execve,openat,open,sendto,socket"
 
+# THE KEYRING MUST LIVE IN THE SHARED WORKDIR, NOT IN THE JAIL'S HOME.
+# This is the whole mechanism. /build is the one directory both phases see, because both
+# bind the same host workdir. A keyring anywhere else -- $HOME, /root/.gnupg, a tmpfs --
+# is destroyed when phase 1's jail exits, so the import "succeeds" and phase 2 still has
+# no key. That failure mode is invisible: gpg reports success, makepkg later reports
+# "unknown public key", and nothing connects the two.
+GNUPGHOME = "/build/gnupg"
+
+# Imported in phase 1 because THIS IS THE ONLY PHASE WITH NETWORK, and a keyserver fetch
+# is a network operation. Leaving it implicit in phase 2 was a real defect in the
+# two-phase design (diagnosed by rafiulbari-0e, 2026-09-17): the offline build reaches for
+# a keyserver it cannot contact and hangs until the timeout. Measured on pkgcacheclean --
+# `unknown public key 019A7474297D8577`, whose fingerprint the PKGBUILD itself declares in
+# validpgpkeys. The jail had the network AND the fingerprint and never put them together.
+#
+# SOURCING THE PKGBUILD EXECUTES IT. That is not a new exposure: `makepkg --verifysource`
+# on the next line sources the same file in the same jail, so parse-time code already runs
+# here by design. Doing it on the HOST to read validpgpkeys would be the unacceptable
+# version, which is why this runs inside.
+#
+# A KEY IMPORT FAILURE IS NOT A FETCH FAILURE and must not be reported as one. An
+# unreachable keyserver, a revoked key and a PKGBUILD with no validpgpkeys at all are
+# three different states; makepkg's own signature check is what decides whether the build
+# may proceed. This step only makes the decision POSSIBLE offline -- it never makes it.
+_KEY_IMPORT = r'''
+export GNUPGHOME=%s
+install -d -m 700 "$GNUPGHOME"
+_keys=$( (source ./PKGBUILD >/dev/null 2>&1; printf '%%s\n' "${validpgpkeys[@]:-}") 2>/dev/null \
+         | grep -Ex '[0-9A-Fa-f]{8,40}' || true )
+if [ -z "$_keys" ]; then
+  echo "ABD_KEY_NONE"
+else
+  for _k in $_keys; do
+    if gpg --batch --quiet --keyserver hkps://keyserver.ubuntu.com --recv-keys "$_k" >/dev/null 2>&1; then
+      echo "ABD_KEY_OK $_k"
+    else
+      echo "ABD_KEY_FAIL $_k"
+    fi
+  done
+fi
+''' % GNUPGHOME
+
 
 def fetch_sources(workdir, timeout=300):
     """Download `source=()` in a NET-ENABLED jail, so the BUILD jail can stay offline.
@@ -38,17 +80,36 @@ def fetch_sources(workdir, timeout=300):
     because the legitimate download already happened somewhere else. No heuristic needed to
     excuse cargo and npm.
     """
-    inner = ("set -o pipefail; cd /build/pkg && "
+    inner = ("set -o pipefail\ncd /build/pkg || exit 1\n" + _KEY_IMPORT +
+             "\nexport GNUPGHOME=" + GNUPGHOME + "\n"
              "makepkg --verifysource --nodeps --noconfirm 2>&1 | tail -30")
     argv = bwrap_argv(workdir, allow_net=True) + ["bash", "-lc", inner]
     meta = {"timeout": False, "rc": None, "tail": ""}
+    full = ""
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         meta["rc"] = p.returncode
-        meta["tail"] = (p.stdout or "")[-1500:]
+        full = p.stdout or ""
+        meta["tail"] = full[-1500:]
     except subprocess.TimeoutExpired:
         meta["timeout"] = True
     meta["ok"] = meta["rc"] == 0 and not meta["timeout"]
+
+    # PARSE THE MARKERS FROM THE FULL STDOUT, NOT FROM meta["tail"].
+    # The markers are printed BEFORE makepkg runs and `tail` keeps the LAST 1500 chars, so a
+    # chatty package would push them out of the window -- and the result would not be an
+    # error, it would be `declared=True, imported=[]`: exactly the reading that means "keys
+    # were needed and none arrived". A successful import would report as the failure it is
+    # designed to detect. Caught before this was ever run; it is the same absence-reads-as-an
+    # -answer shape as the digest file whose non-emptiness stood in for its item count.
+    meta["keys"] = {
+        "declared": "ABD_KEY_NONE" not in full,
+        "imported": [l.split()[1] for l in full.splitlines() if l.startswith("ABD_KEY_OK ")],
+        "failed": [l.split()[1] for l in full.splitlines() if l.startswith("ABD_KEY_FAIL ")],
+        # Truthful under truncation: if the markers were lost we say so rather than infer.
+        "observed": ("ABD_KEY_NONE" in full or "ABD_KEY_OK " in full
+                     or "ABD_KEY_FAIL " in full),
+    }
     return meta
 
 
@@ -71,7 +132,11 @@ def build(pkgbuild_dir, timeout=600, allow_dns=False, keep=False):
     # an aborted makepkg reported rc=0 and the runner called a failed build
     # successful. Measured on yay-bin, which aborts at the download step inside
     # a no-network sandbox and still returned 0.
-    inner = ("set -o pipefail; cd /build/pkg && "
+    # GNUPGHOME POINTS AT PHASE 1's KEYRING. Without this line the import above is dead
+    # work: gpg in the offline jail looks in a fresh HOME, finds nothing, and makepkg
+    # reaches for a keyserver it cannot contact -- the exact hang this change exists to fix.
+    # The two lines are one mechanism and must not be separated.
+    inner = ("set -o pipefail; export GNUPGHOME=" + GNUPGHOME + "; cd /build/pkg && "
              "strace -f -qq -s 256 -e %s -o /build/trace.txt "
              # --skipinteg IS GONE ON PURPOSE. It was needed only because the source
              # could never arrive; now that phase 1 fetches it, checksums are verifiable,

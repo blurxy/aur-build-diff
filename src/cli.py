@@ -142,6 +142,18 @@ def cmd_diff(a):
                              "timed_out": meta["timeout"], "usable": ok}
             note = "timed out" if meta["timeout"] else "rc=%s" % meta["rc"]
             print("  %s  trace=%d B  %s" % (note, meta["trace_bytes"], summarise(p)))
+            # SAY WHAT THE KEY IMPORT DID. Without this line, a reader of a successful
+            # signed build has to INFER that the offline jail verified with an imported key,
+            # from /usr/bin/gpg appearing in execs and resolver_attempts being 0. That
+            # inference happens to be right here and is not something a reader should have to
+            # make: "imported=1" and "failed=1" are opposite situations that both leave gpg
+            # in the trace. Printed only when keys were declared, so unsigned packages --
+            # most of them -- gain no noise.
+            k = (meta.get("fetch") or {}).get("keys") or {}
+            if k.get("declared"):
+                print("  pgp keys declared: imported=%d failed=%d%s" % (
+                    len(k.get("imported") or []), len(k.get("failed") or []),
+                    "" if k.get("observed") else "  (MARKERS NOT OBSERVED -- counts unreliable)"))
             if not ok:
                 print("  this build did not produce a usable profile")
 
