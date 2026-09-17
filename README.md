@@ -249,9 +249,10 @@ observes) · `pgpkey_added` / `pgpkey_removed`.
 - It fetches nothing, so it cannot tell you whether a URL resolves or serves
   what its checksum claims.
 
-### Two defects in this module, both found by real data and neither by my own fixtures
+### Three defects in this module, none of them found by my own fixtures
 
-Seven hand-written self-tests passed while both of these were live:
+Seven hand-written self-tests passed while the first two were live; the third
+was found by another session an hour after it shipped:
 
 1. **`source=("name"::"url")` with both halves quoted parsed as two entries**,
    and the URL kept its quote marks, so `startswith("https://")` was false and
@@ -262,9 +263,23 @@ Seven hand-written self-tests passed while both of these were live:
    releases and called them "the bytes at an unchanged address changed" — true
    of a local file in the least alarming possible way.
 
-Both now have regression tests. The lesson is the one this repo keeps
+3. **"I could not resolve it" rendered as "there was none" — at high severity,
+   on the headline rule.** A baseline entry like `source=("$_upstream/x.tar.gz")`,
+   where `$_upstream` comes from `makepkg.conf` or the environment rather than the
+   file, has `remote=False` because we *do not know*. `went_remote` read that as
+   proof the previous revision fetched nothing. The `unresolved` note didn't
+   offset it — it reported only the *newer* revision, so the side the claim
+   rested on was the one never mentioned. `new_host` had the same bug; one layer
+   up, a **missing** PKGBUILD (`file_at` returns `""`) would have rendered the
+   same way; and `parse()` could not tell "no `source=` line" from "a `source=` I
+   failed to read". Now `went_remote` requires a baseline with no unresolved
+   entries, else emits `baseline_unresolved` at medium. Found by `rafiulbari-0e`.
+
+All three have regression tests. The lesson is the one this repo keeps
 relearning: fixtures test the code against the author's model of the world, and
-it is the model that is wrong.
+it is the model that is wrong — so they cannot fail in the dimension that
+matters. Every one of these was found by real AUR history or by another reader,
+never by a test I wrote.
 
 ## The two-phase build
 
