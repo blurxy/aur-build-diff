@@ -74,3 +74,18 @@ def checkout_to(repo, sha, dest):
         raw = subprocess.run(["git", "archive", sha], cwd=repo, capture_output=True).stdout
         subprocess.run(["tar", "-x", "-C", dest], input=raw, capture_output=True, check=True)
     return dest
+
+
+def file_at(repo, sha, path):
+    """One file's contents at one revision, without materialising the tree.
+
+    The declaration diff needs two PKGBUILD texts and nothing else. Checking
+    out both revisions to read one file each would cost two tar extractions and
+    a temp directory per comparison, which is most of what makes the static
+    check worth having disappear.
+    """
+    p = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (sha, path)],
+                       capture_output=True)
+    if p.returncode != 0:
+        return ""
+    return p.stdout.decode("utf-8", "replace")

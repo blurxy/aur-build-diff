@@ -14,7 +14,7 @@ until you pass --build.
 import argparse, os, shutil, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import aur, sandbox
+import aur, sandbox, sources
 from profile import compare, looks_unbuilt
 from runner import build as run_build, summarise
 
@@ -46,10 +46,15 @@ def cmd_history(a):
 
 
 def cmd_diff(a):
-    ok, _ = sandbox.verify()
-    if not ok:
-        print("REFUSING: sandbox isolation check failed. Run --check-sandbox.", file=sys.stderr)
-        return 1
+    # The sandbox only gates BUILDING. The declaration diff reads text and runs
+    # no third-party code, so gating it on an isolation check would withhold the
+    # one signal that is always available -- including on the machines where the
+    # sandbox does not hold, which is exactly when a reader needs something.
+    if a.do_build:
+        ok, _ = sandbox.verify()
+        if not ok:
+            print("REFUSING: sandbox isolation check failed. Run --check-sandbox.", file=sys.stderr)
+            return 1
     if not aur.exists(a.package):
         print("no such AUR package: %s" % a.package, file=sys.stderr)
         return 2
@@ -67,6 +72,19 @@ def cmd_diff(a):
         print("package   %s" % a.package)
         print("newer     %s  %s  %s" % (new[0][:10], new[1], new[2]))
         print("baseline  %s  %s  %s" % (old[0][:10], old[1], old[2]))
+        # ------------------------------------------------ declared sources ---
+        # Free, instant, and the only check that catches a package which never
+        # fetched and now does -- proving that BEHAVIOURALLY needs a completed
+        # build, and the build is what the sandbox stops.
+        old_txt = aur.file_at(repo, old[0], "PKGBUILD")
+        new_txt = aur.file_at(repo, new[0], "PKGBUILD")
+        sf = sources.diff(old_txt, new_txt)
+        print("\nDECLARED SOURCES  (static; no build, no sandbox)")
+        print(sources.summarise(sf) if sf else "  " + sources.summarise(sf))
+        if a.static:
+            print("\nSTATIC ONLY. Nothing has been built.")
+            return 0
+
         if not a.do_build:
             print("\nPLAN ONLY. Nothing has been built.")
             print("Re-run with --build to execute both PKGBUILDs in the sandbox.")
@@ -118,6 +136,8 @@ def main():
                     help="actually build both versions (runs third-party code in the sandbox)")
     ap.add_argument("--against", type=int, default=1, metavar="N",
                     help="compare against the Nth older revision (default 1)")
+    ap.add_argument("--static", action="store_true",
+                    help="diff the declared sources only; no build, no sandbox")
     ap.add_argument("--limit", type=int, default=8)
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--check-sandbox", action="store_true",

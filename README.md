@@ -11,6 +11,11 @@ isolated sandbox, and diff what each one actually *does*.
 > build and asserts the tool goes red, because a suite that has never been red
 > proves nothing.
 >
+> `--static` diffs what a PKGBUILD *declares* in **1.3 seconds** with no build,
+> no sandbox and no root — and it is the only check that catches a package which
+> never fetched and now does, because proving that behaviourally needs a
+> completed build and completing the build is what the sandbox prevents.
+>
 > The defect that made this unusable — the sandbox blocked DNS, `makepkg` needs
 > DNS to fetch `source=()`, so almost no package could build and two sessions got
 > a confident `unchanged` for builds that never happened — is **fixed**, by
@@ -181,6 +186,85 @@ The extra relative write is visible in the profile and correctly not a finding.
 **Not fixed: defect 7.** Read a `changed` that names makepkg's own tools (`file`,
 `ln`, `readelf`, `strip`, `bsdtar`, `fakeroot`) as "this package started producing
 output", not as "this package started inspecting binaries".
+
+## The declaration diff: the check that actually catches it
+
+The headline case for a tool like this is a package that has not touched the
+network in six releases and suddenly does. `rafiulbari-0e` went looking for
+exactly that and found it: `pkgcacheclean` carried
+`source=($pkgname.c $pkgname.8)` — two local files compiled in place — for six
+revisions, then commit `41aa13ae` switched to a GitHub release tarball.
+
+**The behavioural differ could not report it, and cannot.** Demonstrating
+"this version fetches" requires a *completed* build, and completing the build is
+what the sandbox exists to prevent. The evidence for the finding destroys the
+run that would produce it. Measured: that build times out even with the
+two-phase fetch and a 300s budget. What came out instead was a confident red
+about `/usr/bin/gpg` — which was [defect 8](#what-is-broken).
+
+`src/sources.py` reads the PKGBUILD instead. No build, no sandbox, no `makepkg`:
+
+```console
+$ aur-build-diff pkgcacheclean --static
+package   pkgcacheclean
+newer     41aa13ae07  2019-05-26  1.9.0-3
+baseline  904f275e16  2017-09-07  1.9.0-2
+
+DECLARED SOURCES  (static; no build, no sandbox)
+  [high  ] the previous revision declared NO remote source; this one fetches 2:
+           https://github.com/dbermond/pkgcacheclean/archive/v1.9.0.tar.gz,
+           .../releases/download/v1.9.0/pkgcacheclean-1.9.0.tar.gz.asc
+  [medium] signing key changed to one the previous revision did not trust:
+           3FFA6AB7B69AAE6CCA263DDE019A7474297D8577
+```
+
+**1.3 seconds**, most of it the git clone.
+
+### It discriminates, which is the only thing that makes a finding mean anything
+
+Across `pkgcacheclean`'s whole history it fires on **one** transition and is
+silent on the other five. Three unrelated packages are silent too:
+
+| comparison | result |
+|---|---|
+| `pkgcacheclean` 1.9.0-2 → 1.9.0-3 | **1 finding** — went remote |
+| `pkgcacheclean` ×5 other releases | clean |
+| `downgrade`, `yay-bin`, `update-grub` | clean |
+
+### What it reads
+
+`went_remote` (declared no remote source, now does) · `new_host` ·
+`checksum_changed_same_url` (the bytes at an unchanged address changed) ·
+`integrity_skipped` · `sums_removed` · `install_script` (gained a scriptlet,
+which runs as **root** on the installing machine, outside anything this sandbox
+observes) · `pgpkey_added` / `pgpkey_removed`.
+
+### What it cannot do, stated because a static check quiet about its blind spots is the failure this repo keeps finding
+
+- It reads the **declared** array. A PKGBUILD that runs `curl` inside `build()`
+  is invisible here and visible to the behavioural differ. The two are
+  complementary in both directions, not ranked.
+- Variable expansion is shallow and textual. Anything computed by shell is left
+  alone and reported as `unresolved` rather than guessed at.
+- It fetches nothing, so it cannot tell you whether a URL resolves or serves
+  what its checksum claims.
+
+### Two defects in this module, both found by real data and neither by my own fixtures
+
+Seven hand-written self-tests passed while both of these were live:
+
+1. **`source=("name"::"url")` with both halves quoted parsed as two entries**,
+   and the URL kept its quote marks, so `startswith("https://")` was false and
+   it was classified **local**. On the real `pkgcacheclean` the release tarball
+   was not counted as a remote source at all — only its detached `.asc`.
+2. **`checksum_changed_same_url` fired on local files.** A local file's checksum
+   changing is what a version bump *is*. It fired on two of three ordinary
+   releases and called them "the bytes at an unchanged address changed" — true
+   of a local file in the least alarming possible way.
+
+Both now have regression tests. The lesson is the one this repo keeps
+relearning: fixtures test the code against the author's model of the world, and
+it is the model that is wrong.
 
 ## The two-phase build
 
