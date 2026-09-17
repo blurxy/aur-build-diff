@@ -98,7 +98,19 @@ def bwrap_argv(workdir, extra_ro=(), allow_dns=False, allow_net=False):
         if os.path.isfile(real):
             link = os.path.normpath(os.path.join("/etc", os.readlink("/etc/resolv.conf"))) \
                    if os.path.islink("/etc/resolv.conf") else "/etc/resolv.conf"
-            argv += ["--dir", os.path.dirname(link), "--ro-bind", real, link]
+            # --remount-ro ON THE DIRECTORY, found by rafiulbari-57 reviewing this branch.
+            # --dir creates it WRITABLE, and this is the one phase that runs a package's
+            # parse-time code WITH network, so a writable directory there is a surface even
+            # if no concrete channel is obvious. 57's reasoning that it is probably harmless
+            # is sound -- parse-time code cannot conjure the host's socket, a socket it
+            # creates it must also listen on, and a ro-bind cannot be unlinked while mounted
+            # -- but "probably harmless in the jail that has network and hostile code" is not
+            # a property to leave resting on an argument. The remount costs one flag.
+            # A --dir is not its own mount point, so --remount-ro on it fails with "Unable
+            # to find ... in mount table" (measured). --tmpfs makes it a real mount, THEN the
+            # remount can take. The file bind is its own mount and survives the remount.
+            d = os.path.dirname(link)
+            argv += ["--tmpfs", d, "--ro-bind", real, link, "--remount-ro", d]
     return argv
 
 
