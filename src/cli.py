@@ -78,8 +78,18 @@ def cmd_diff(a):
         # build, and the build is what the sandbox stops.
         old_txt = aur.file_at(repo, old[0], "PKGBUILD")
         new_txt = aur.file_at(repo, new[0], "PKGBUILD")
-        sf = sources.diff(old_txt, new_txt)
         print("\nDECLARED SOURCES  (static; no build, no sandbox)")
+        if not old_txt.strip() or not new_txt.strip():
+            # file_at returns "" when git cannot produce the blob. An empty text
+            # parses to zero sources, which would render a MISSING PKGBUILD as
+            # "declared no remote source" and fire went_remote at high severity.
+            # Absence reading as an answer, one layer above the same bug inside
+            # sources.diff().
+            missing = "baseline" if not old_txt.strip() else "newer"
+            print("  unknown -- the %s revision has no readable PKGBUILD, so its "
+                  "declarations cannot be compared" % missing)
+            return 0
+        sf = sources.diff(old_txt, new_txt)
         print(sources.summarise(sf) if sf else "  " + sources.summarise(sf))
         if a.static:
             print("\nSTATIC ONLY. Nothing has been built.")

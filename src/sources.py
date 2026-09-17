@@ -149,6 +149,14 @@ def parse(text):
                      "unresolved": "$" in loc})
     return {
         "sources": srcs,
+        # "there is no source= line" and "there is one I could not read" are
+        # different facts. Collapsing them means a package that declares nothing
+        # and a package whose declaration defeated the parser produce the same
+        # answer, and a real `declares nothing -> fetches from github`
+        # transition goes unreported. (rafiulbari-0e hit this from the other
+        # side in their own implementation: pkgbuild-introspection 611238ab.)
+        "declared": bool(re.search(r"^\s*source(_[a-z0-9_]+)?\s*=\s*\(", text, re.M)),
+        "unresolved": [s["loc"] for s in srcs if s["unresolved"]],
         "sums": {k: _array(text, k) for k in
                  ("sha256sums", "sha512sums", "sha1sums", "md5sums", "b2sums")
                  if _array(text, k)},
@@ -180,7 +188,25 @@ def diff(old_text, new_text):
     n_remote = [s for s in n["sources"] if s["remote"]]
 
     # THE HEADLINE CASE. A package that fetched nothing and now fetches.
-    if not o_remote and n_remote:
+    #
+    # IT REQUIRES A BASELINE WE COULD ACTUALLY READ. An entry holding a variable
+    # this module cannot resolve -- one defined in makepkg.conf, the
+    # environment, or built inside a function -- has remote=False, because we do
+    # not know. Reading that as "there was no remote source" turns "I could not
+    # determine" into a HIGH-severity assertion that the previous revision did
+    # not fetch, on the one rule this tool is proudest of. Found by
+    # rafiulbari-0e against src/sources.py an hour after it shipped.
+    if not o["declared"] and not n["declared"]:
+        pass
+    elif o["unresolved"]:
+        findings.append({
+            "kind": "baseline_unresolved", "severity": "medium",
+            "detail": "whether the previous revision fetched CANNOT be determined "
+                      "without running shell -- %d of its source entries hold a "
+                      "variable this does not resolve (%s). No went_remote claim "
+                      "is made." % (len(o["unresolved"]), ", ".join(o["unresolved"][:3])),
+        })
+    elif not o_remote and n_remote:
         findings.append({
             "kind": "went_remote", "severity": "high",
             "detail": "the previous revision declared NO remote source; this one "
@@ -191,6 +217,11 @@ def diff(old_text, new_text):
     o_hosts = {s["host"] for s in o_remote if s["host"]}
     n_hosts = {s["host"] for s in n_remote if s["host"]}
     added = sorted(n_hosts - o_hosts)
+    # Same guard: an unresolved baseline entry pointing at $_mirror leaves its
+    # host out of o_hosts, so a newer revision that hard-codes that very host
+    # would read as reaching somewhere new.
+    if o["unresolved"]:
+        added = []
     if added and o_remote:
         findings.append({
             "kind": "new_host", "severity": "high",
@@ -277,12 +308,24 @@ def diff(old_text, new_text):
         findings.append({"kind": "went_local", "severity": "info",
                          "detail": "no longer declares any remote source"})
 
-    unresolved = [s["loc"] for s in n["sources"] if s["unresolved"]]
-    if unresolved:
+    # Report unresolved entries on BOTH sides. Reporting only the newer one is
+    # how the baseline defect above stayed invisible: the side the went_remote
+    # claim rests on was the side never mentioned.
+    for side, pp in (("newer", n), ("previous", o)):
+        if pp["unresolved"]:
+            findings.append({
+                "kind": "unresolved", "severity": "info",
+                "detail": "%s revision: could not resolve to a host without "
+                          "running shell: %s" % (side, ", ".join(pp["unresolved"][:3])),
+            })
+
+    if o["declared"] != n["declared"]:
         findings.append({
-            "kind": "unresolved", "severity": "info",
-            "detail": "could not resolve to a host without running shell: %s"
-                      % ", ".join(unresolved[:3]),
+            "kind": "declaration_appeared" if n["declared"] else "declaration_removed",
+            "severity": "medium",
+            "detail": "a source array %s between these revisions"
+                      % ("appeared where there was none" if n["declared"]
+                         else "was removed entirely"),
         })
     return findings
 
@@ -370,6 +413,37 @@ source=("${pkgname}-${pkgver}.tar.gz"::"https://github.com/d/pkgcacheclean/archi
     L2 = "pkgname=p\npkgver=1.1\nsource=(p.c p.8)\nsha256sums=('cc' 'bb')\n"
     assert not [x for x in diff(L1, L2) if x["kind"] == "checksum_changed_same_url"], \
         "a local file's checksum changing must not read as a swapped tarball"
+
+    # REGRESSION (rafiulbari-0e, against the shipped module): a baseline entry
+    # whose variable is defined NOWHERE IN THE FILE resolves to nothing, and
+    # "could not determine" must not render as "there was none" at high severity.
+    U1 = 'pkgname=demo\npkgver=1.0\nsource=("$_upstream/demo-$pkgver.tar.gz")\n'
+    U2 = 'pkgname=demo\npkgver=1.0\nsource=("https://github.com/demo/demo/archive/v$pkgver.tar.gz")\n'
+    uf = diff(U1, U2)
+    assert "went_remote" not in {x["kind"] for x in uf}, \
+        "an unresolvable baseline must not prove the baseline fetched nothing"
+    assert "baseline_unresolved" in {x["kind"] for x in uf}, \
+        "it must say the baseline could not be determined"
+    assert any(x["kind"] == "unresolved" and "previous" in x["detail"] for x in uf), \
+        "unresolved must be reported for the PREVIOUS side too, not only the newer"
+
+    # ...and new_host must take the same guard: an unresolved $_mirror leaves its
+    # host out of the baseline, so hard-coding that same host is not a new host.
+    M1 = 'pkgname=d\nsource=("$_mirror/d.tar.gz")\n'
+    M2 = 'pkgname=d\nsource=("https://cdn.example/d.tar.gz")\n'
+    assert "new_host" not in {x["kind"] for x in diff(M1, M2)}
+
+    # The expander must still resolve what IS in the file -- this guard must not
+    # turn into a blanket excuse that suppresses real findings.
+    R1 = 'pkgname=d\n_mirror="https://good.example/p"\nsource=("$_mirror/d.tar.gz")\n'
+    R2 = 'pkgname=d\n_mirror="https://cdn.attacker.example/p"\nsource=("$_mirror/d.tar.gz")\n'
+    assert "new_host" in {x["kind"] for x in diff(R1, R2)}, \
+        "a mirror host defined IN the file must still be resolved and compared"
+
+    # "no source= line at all" is not the same fact as "source= I could not read".
+    assert parse("pkgname=d\n")["declared"] is False
+    assert parse("pkgname=d\nsource=()\n")["declared"] is True
+    assert "declaration_appeared" in {x["kind"] for x in diff("pkgname=d\n", U2)}
 
     print("\nself-test: went_remote=OK  version-bump-not-a-swap=OK  swap=OK")
     print("           arch-array=OK  install=OK  SKIP=OK  identical-silent=OK")
