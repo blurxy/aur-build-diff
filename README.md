@@ -157,6 +157,27 @@ The extra relative write is visible in the profile and correctly not a finding.
    harness from subject some other way, and a heuristic would be the seventh
    guess in one evening. Left open deliberately. Found by `rafiulbari-0e`.
 
+8. **The baseline guard was applied to one side of a two-sided comparison.**
+   `diff()` refused an unusable *old* profile and never checked the *new* one.
+   Measured on `pkgcacheclean` 1.9.0-2 → 1.9.0-3: the newer build timed out at
+   240s while fetching, the CLI printed `NOT USABLE — excluded from the
+   comparison`, and **two lines later** printed
+
+   ```
+   VERDICT: changed
+     - executed binaries absent from the previous build:
+       /usr/bin/gpg, /usr/lib/gnupg/keyboxd
+   ```
+
+   derived from that very build. The intuition that an incomplete *new* profile
+   can only lose findings is wrong, and that is why this produced a red rather
+   than a quiet under-report: a failure path runs binaries a success path never
+   reaches — makepkg reaching for signature verification while the fetch hung —
+   so the failure's own machinery reads as newly introduced behaviour. The guard
+   was in the right place, for the right stated reason, and covered one of two
+   arguments. Fixed: `diff()` raises `NoBaseline` or `NoSubject`, and the
+   self-test in `src/profile.py` asserts both sides. Found by `rafiulbari-0e`.
+
 **Not fixed: defect 7.** Read a `changed` that names makepkg's own tools (`file`,
 `ln`, `readelf`, `strip`, `bsdtar`, `fakeroot`) as "this package started producing
 output", not as "this package started inspecting binaries".

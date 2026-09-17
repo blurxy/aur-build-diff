@@ -14,8 +14,23 @@ import re, json, os
 from collections import Counter
 
 
-class NoBaseline(Exception):
-    """Raised when the older build produced no usable profile to compare against."""
+class Unusable(Exception):
+    """One side of the comparison produced no usable profile.
+
+    Carries WHICH side, because the two mean opposite things and the caller
+    must be able to say which it hit.
+    """
+    side = "?"
+
+
+class NoBaseline(Unusable):
+    """The OLDER build produced no usable profile to compare against."""
+    side = "baseline"
+
+
+class NoSubject(Unusable):
+    """The NEWER build produced no usable profile to draw conclusions from."""
+    side = "newer"
 
 # A build tree is allowed to be written to; that is what a build is.
 BUILD_PREFIXES = ("/build", "/tmp", "/dev", "/proc", "/sys", "/run")
@@ -116,6 +131,17 @@ def looks_unbuilt(prof):
     return not prof.get("execs")
 
 
+def _why_unusable(prof):
+    b = prof.get("_build") or {}
+    if not b:
+        return "it records no execs, so it never ran"
+    if b.get("fetch_failed"):
+        return "it aborted, having failed to fetch sources"
+    if b.get("timed_out"):
+        return "it timed out"
+    return "it aborted (rc=%s)" % b.get("rc")
+
+
 def diff(old, new):
     """What the new version does that the old one never did.
 
@@ -130,14 +156,32 @@ def diff(old, new):
     completely different things. Raising here means the distinction cannot be
     lost by a caller who forgot to check, which a separate guard in the CLI
     could not guarantee. (rafiulbari's alienware-main-chat, 2026-09-16.)
+
+    AND IT GUARDS BOTH SIDES, because the first version guarded only `old`.
+    That reasoning above is correct and it was applied to one of two arguments.
+    Measured on pkgcacheclean 1.9.0-2 -> 1.9.0-3: the newer build timed out at
+    240s while fetching, the CLI printed "NOT USABLE -- excluded from the
+    comparison", and two lines later printed a confident
+
+        VERDICT: changed
+          - executed binaries absent from the previous build:
+            /usr/bin/gpg, /usr/lib/gnupg/keyboxd
+
+    derived from that very build. The intuition that an incomplete NEW profile
+    can only LOSE findings is wrong: a failure path executes binaries a success
+    path never reaches -- makepkg reaching for signature verification while the
+    fetch hung -- so the failure's own machinery is read as newly introduced
+    behaviour. Found by rafiulbari-0e, 2026-09-17.
     """
     if looks_unbuilt(old):
-        b = old.get("_build") or {}
-        why = ("it aborted (%s)" % ("failed to fetch sources" if b.get("fetch_failed")
-                                    else "rc=%s" % b.get("rc"))
-               if b else "it records no execs, so it never ran")
         raise NoBaseline("the baseline build produced no usable profile: %s. "
-                         "There is nothing to compare against." % why)
+                         "There is nothing to compare against." % _why_unusable(old))
+    if looks_unbuilt(new):
+        raise NoSubject("the newer build produced no usable profile: %s. A failed "
+                        "build is not an empty one -- its failure path runs binaries "
+                        "the success path never reaches -- so diffing it would report "
+                        "that machinery as newly introduced behaviour. There is "
+                        "nothing here to draw a conclusion from." % _why_unusable(new))
     out = {}
     for key in ("connects", "execs", "writes_outside", "writes_denied", "names"):
         o, n = set(old.get(key, {})), set(new.get(key, {}))
@@ -153,7 +197,7 @@ def compare(old, new, has_history=True):
         return "unknown", ["no prior version to diff against; static allowlist only"], {}
     try:
         d = diff(old, new)
-    except NoBaseline as e:
+    except Unusable as e:
         return "unknown", ["%s" % e], {}
     v, why = verdict(d, has_history=True)
     return v, why, d
@@ -211,5 +255,18 @@ openat(AT_FDCWD, "/home/u/.config/systemd/user/upd.service", O_WRONLY|O_CREAT, 0
     empty = {"connects": {}, "execs": {}, "writes_outside": {}, "names": {}}
     v3, why3, _ = compare(empty, b)
     assert v3 == "unknown", "an unbuilt baseline must be unknown, not changed"
+
+    # ...and neither must an unbuilt SUBJECT. Regression test for the defect
+    # where the guard existed, was well-argued, and covered one of two sides.
+    # The failed side carries the _build provenance the runner attaches, and
+    # carries execs, because the whole point is that a failed build is not empty.
+    failed = {"connects": {}, "writes_outside": {}, "names": {},
+              "_build": {"usable": False, "rc": None, "timed_out": True},
+              "execs": {"/usr/bin/gpg": 1, "/usr/lib/gnupg/keyboxd": 1}}
+    v4, why4, _ = compare(a, failed)
+    assert v4 == "unknown", "an unbuilt SUBJECT must be unknown, not changed"
+    assert not any("executed binaries" in w for w in why4), \
+        "the failed build's own machinery was reported as a finding"
     print("\nself-test: changed-detects=OK  clean-vs-clean-silent=OK")
+    print("           failed-subject  -> %s (%s)" % (v4, why4[0][:52]))
     print("           failed-baseline -> %s (%s)" % (v3, why3[0][:60]))
