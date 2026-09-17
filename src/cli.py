@@ -11,12 +11,40 @@ hostile. The sandbox is real -- no routes, no resolver socket, verified by
 the default is a plan showing exactly what WOULD be built, and nothing runs
 until you pass --build.
 """
-import argparse, os, shutil, sys, tempfile
+import argparse, os, shutil, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aur, sandbox, sources
 from profile import compare, looks_unbuilt
 from runner import build as run_build, summarise
+
+
+def tool_version():
+    """The commit this tool is running from.
+
+    A behavioural verdict with no build identity is a derived artifact with no
+    falsifier. rafiulbari-0e nearly reported defect 8 as still-live because the
+    shared working tree happened to be parked on a branch that lacked the fix,
+    and NOTHING in the output named the commit that produced the verdict -- so
+    "the guard does not work" and "you measured a tree without the guard" were
+    indistinguishable from the result alone.
+
+    That is the same ambient-condition failure as uid for an nmap probe, mount
+    namespace for a resolver socket, and role USAGE for a schema listing: a
+    sound probe, a confident specific result, and a silent input deciding it.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode:
+            return "unknown (not a git checkout)"
+        sha = r.stdout.strip()
+        d = subprocess.run(["git", "-C", here, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=5)
+        return sha + (" +dirty" if d.stdout.strip() else "")
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def cmd_check_sandbox(_a):
@@ -70,6 +98,7 @@ def cmd_diff(a):
         new, old = vs[0], vs[a.against]
 
         print("package   %s" % a.package)
+        print("tool      %s" % tool_version())
         print("newer     %s  %s  %s" % (new[0][:10], new[1], new[2]))
         print("baseline  %s  %s  %s" % (old[0][:10], old[1], old[2]))
         # ------------------------------------------------ declared sources ---
